@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Run a bounded CPU stress test on an Android device over ADB.
+
+How it works: validate the requested duration and worker count, optionally
+connect to a device, and use ADB to confirm it is online and authorized. The
+remote shell launches the requested number of ``yes`` processes writing to
+``/dev/null`` (creating CPU load), sleeps for the bounded duration, then kills
+and waits for only those workers. Subprocess timeouts and failures are reported
+with nonzero exit codes.
+
+Use this script from the VS Code integrated terminal after installing Android
+Platform Tools and enabling USB debugging on the device. Run ``python stress.py
+--list-devices`` to find its serial, then choose it with ``--serial``. For an
+authorized wireless ADB device, use ``--connect HOST:PORT``. Set the test period
+with ``--seconds`` (1–60) and CPU load with ``--workers`` (1–4). This creates
+CPU load but does not collect performance metrics; use a monitoring tool to
+observe the processor while the test runs.
+
+Examples::
+
+    python stress.py --list-devices
+    python stress.py --serial DEVICE_SERIAL --seconds 30 --workers 2
+    python stress.py --connect 192.168.1.25:5555 --seconds 15
+"""
+
+import argparse
+import shutil
+import subprocess
+import sys
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--serial", help="ADB serial of an already connected device")
+    parser.add_argument("--connect", help="Connect to an authorized device (HOST:PORT)")
+    parser.add_argument("--list-devices", action="store_true", help="List devices visible to ADB and exit")
+    parser.add_argument("--seconds", type=int, default=10, help="Duration, 1–60 seconds")
+    parser.add_argument("--workers", type=int, default=1, help="CPU workers, 1–4")
+    args = parser.parse_args()
+
+    if not 1 <= args.seconds <= 60:
+        parser.error("--seconds must be between 1 and 60")
+    if not 1 <= args.workers <= 4:
+        parser.error("--workers must be between 1 and 4")
+    if args.serial and args.connect:
+        parser.error("choose either --serial or --connect")
+    if args.list_devices and (args.serial or args.connect):
+        parser.error("--list-devices cannot be combined with --serial or --connect")
+    if not shutil.which("adb"):
+        print("Error: adb is not installed or not in PATH.", file=sys.stderr)
+        return 1
+
+    if args.list_devices:
+        try:
+            result = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Could not list devices: {exc}", file=sys.stderr)
+            return 1
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+        return result.returncode
+
+    if args.connect:
+        try:
+            result = subprocess.run(
+                ["adb", "connect", args.connect], capture_output=True, text=True, timeout=15
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"ADB connect failed: {exc}", file=sys.stderr)
+            return 1
+        print((result.stdout or result.stderr).strip())
+        if result.returncode:
+            return result.returncode
+
+    adb = ["adb"] + (["-s", args.serial or args.connect] if args.serial or args.connect else [])
+    try:
+        state = subprocess.run(adb + ["get-state"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Could not query device: {exc}", file=sys.stderr)
+        return 1
+    if state.returncode or state.stdout.strip() != "device":
+        print("No online, authorized ADB device. Check USB debugging and device authorization.", file=sys.stderr)
+        return 1
+
+    # Android's toybox provides yes. Keep worker PIDs local to this shell so
+    # cleanup cannot kill unrelated processes on the device.
+    script = (
+        "pids=''; i=0; "
+        f"while [ \"$i\" -lt {args.workers} ]; do "
+        "yes > /dev/null & pids=\"$pids $!\"; i=$((i + 1)); done; "
+        f"sleep {args.seconds}; "
+        "for pid in $pids; do kill \"$pid\" 2>/dev/null; done; wait 2>/dev/null"
+    )
+    print(
+        f"Running {args.workers} CPU worker(s) for {args.seconds} seconds. "
+        "Use only on a device you own or are authorized to test."
+    )
+    try:
+        result = subprocess.run(adb + ["shell", "sh", "-c", script], timeout=args.seconds + 15)
+    except subprocess.TimeoutExpired:
+        print("ADB shell timed out; the remote shell should stop its workers when it exits.", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Could not run stress test: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode:
+        print("Stress test failed (the device may not provide the toybox yes command).", file=sys.stderr)
+        return result.returncode
+    print("Stress test complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
